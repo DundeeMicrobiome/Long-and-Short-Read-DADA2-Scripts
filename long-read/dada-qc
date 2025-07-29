@@ -1,0 +1,69 @@
+#!/usr/bin/env Rscript
+
+#$ -j y
+#$ -cwd
+
+# Script to generate QC plots objects for 16S amplicon sequencing using dada2,
+
+library("getopt")
+
+optspec=matrix(c(
+	'reads',     'r', 1, 'character', 'Path to directory of fastq files',
+	'out_dir',   'o', 1, 'character', 'Path to output directory',
+    'aggregate', 'a', 0, 'logical',   'Produce aggregated plots',
+	'help',      'h', 0, 'logical',   'Display help'
+),byrow=TRUE,ncol=5)
+
+opt=getopt(optspec)
+
+if (!is.null(opt$help)) {
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$reads)) {
+	cat("Error: no reads argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$out_dir)) {
+	cat("Error: no out_dir argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+aggregate=FALSE
+
+if (!is.null(opt$aggregate)) {
+	aggregate=TRUE
+}
+
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+
+writeLines(capture.output(sessionInfo()), "Loop_sessionInfo.txt")
+
+set.seed(100)
+
+read_path=opt$reads
+out_dir=opt$out_dir
+
+dir.create(file.path(out_dir),showWarnings=FALSE)
+
+cat("dada2 QC analysis\n==============\n\n")
+cat(paste("Reads: ",read_path,"\n\n"))
+
+fns<-sort(list.files(read_path, full.names=TRUE))
+fnFs<-fns[grepl(".fq",fns)]
+
+fnFs <- as.list(fnFs)
+for(i in 1:length(fnFs)) {                              
+  fnFs[[i]] <- plotQualityProfile(fnFs[[i]],aggregate=aggregate)
+  ggsave(paste(out_dir,'/forward_read_quality',i,'.pdf',sep=''),plot=fnFs[[i]])
+}
+
+if (file.exists('Rplots.pdf')) {
+  file.remove('Rplots.pdf')
+}
