@@ -1,0 +1,161 @@
+#!/usr/bin/env Rscript
+#$ -j y
+#$ -cwd
+#$ -V
+#$ -pe smp 24
+#$ -mods l_hard mfree 200G
+
+num_threads=24
+
+suppressPackageStartupMessages({
+library("dada2")
+library("ShortRead")
+library("Biostrings")
+library("getopt")
+library("ggpubr")
+library("ggplot2")
+library("gridExtra")
+})
+
+optspec=matrix(c(
+'reads', 'r', 1, 'character', 'Path to directory of fastq files',
+'out_dir', 'o', 1, 'character', 'Path to output directory',
+'aggregate', 'a', 0, 'logical', 'Produce aggregated plots',
+'help', 'h', 0, 'logical', 'Display help'
+),byrow=TRUE,ncol=5)
+
+opt=getopt(optspec)
+
+if (!is.null(opt$help)) {
+cat(getopt(optspec,usage=TRUE))
+q(status=1)
+}
+
+if (is.null(opt$reads)) {
+cat("Error: no reads argument provided\n")
+cat(getopt(optspec,usage=TRUE))
+q(status=1)
+}
+
+if (is.null(opt$out_dir)) {
+cat("Error: no out_dir argument provided\n")
+244
+cat(getopt(optspec,usage=TRUE))
+q(status=1)
+}
+
+aggregate=FALSE
+if (!is.null(opt$aggregate)) {
+aggregate=TRUE
+}
+
+writeLines(capture.output(sessionInfo()), "primerremoval.sessionInfo.txt")
+
+set.seed(100)
+
+read_path=opt$reads
+filt_path="PriTrim_Fastqs"
+out_dir=opt$out_dir
+
+dir.create(file.path(out_dir),showWarnings=FALSE)
+
+if(!file.exists('TrimPlots')) {
+dir.create('TrimPlots')
+}
+
+message(paste("Read directory: ",read_path))
+message("List of files\n==============")
+list.files(read_path)
+
+#Sort into forward and reverse reads
+fnFs <- sort(list.files(read_path, pattern = "_R1_001.fastq.gz|_R1_001.fastq", full.names =
+TRUE))
+fnRs <- sort(list.files(read_path, pattern = "_R2_001.fastq.gz|_R2_001.fastq", full.names =
+TRUE))
+
+FWD <-"<insert_forward_primer>"
+REV <-"<insert_reverse_primer>"
+
+allOrients <- function(primer) {
+# Create all orientations of the input sequence
+require(Biostrings)
+dna <- DNAString(primer)
+orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna),
+RevComp = reverseComplement(dna))
+return(sapply(orients, toString))
+}
+
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+
+fnFs.filtN <- file.path(filt_path, "filtN", basename(fnFs))
+fnRs.filtN <- file.path(filt_path, "filtN", basename(fnRs))
+
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = num_threads)
+
+primerHits <- function(primer, fn) {
+nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+return(sum(nhits > 0))
+}
+
+message(paste("\nPrimers number of reads by orientation\n==============\n"))
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]),
+FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]),
+REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]),
+REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+
+cutadapt <-"<insert_path_to_cutadapt_conda_env>"
+system2(cutadapt, args = "--version")
+
+path.cut <- file.path(filt_path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC)
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC)
+
+for(i in seq_along(fnFs)) {
+system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2, "-m", 1, # -n 2 required to remove
+FWD and REV from reads
+"
+-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+fnFs.filtN[i], fnRs.filtN[i])) # input files
+}
+
+message(paste("\nPrimers number of reads by orientation after primer
+removal\n==============\n"))
+246
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]),
+FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.cut[[1]]),
+REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.cut[[1]]),
+REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+
+Cutfns<-sort(list.files(path.cut, full.names=TRUE))
+fnFs<-Cutfns[grepl("_R1",Cutfns)]
+fnRs<-Cutfns[grepl("_R2",Cutfns)]
+
+f_plot<-plotQualityProfile(fnFs,aggregate=aggregate)
+r_plot<-plotQualityProfile(fnRs,aggregate=aggregate)
+
+fnFs <- as.list(fnFs)
+
+for(i in 1:length(fnFs)) {
+fnFs[[i]] <- plotQualityProfile(fnFs[[i]],aggregate=aggregate)
+ggsave(paste(out_dir,'/Ptestforward_trim_read_quality',i,'.pdf',sep=''),plot=fnFs[[i]])
+}
+
+fnRs <- as.list(fnRs)
+for(i in 1:length(fnRs)) {
+fnRs[[i]] <- plotQualityProfile(fnRs[[i]],aggregate=aggregate)
+ggsave(paste(out_dir,'/Ptestreverse_trim_read_quality',i,'.pdf',sep=''),plot=fnRs[[i]])
+}
+
+if (file.exists('Rplots.pdf')) {
+file.remove('Rplots.pdf')
+}
