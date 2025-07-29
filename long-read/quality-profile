@@ -1,0 +1,199 @@
+#!/usr/bin/env Rscript
+
+#$ -j y
+#$ -cwd
+
+# Script to generate QC plots objects for 16S amplicon sequencing using dada2,
+
+library("getopt")
+
+optspec=matrix(c(
+	'reads',     'r', 1, 'character', 'Path to directory of fastq files',
+	'out_dir',   'o', 1, 'character', 'Path to output directory',
+    'aggregate', 'a', 0, 'logical',   'Produce aggregated plots',
+	'help',      'h', 0, 'logical',   'Display help'
+),byrow=TRUE,ncol=5)
+
+opt=getopt(optspec)
+
+if (!is.null(opt$help)) {
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$reads)) {
+	cat("Error: no reads argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$out_dir)) {
+	cat("Error: no out_dir argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+aggregate=FALSE
+
+if (!is.null(opt$aggregate)) {
+	aggregate=TRUE
+}
+
+library("ggplot2")
+library("gridExtra")
+library("dada2")
+
+writeLines(capture.output(sessionInfo()), "Loop_sessionInfo.txt")
+
+set.seed(100)
+
+read_path=opt$reads
+out_dir=opt$out_dir
+
+dir.create(file.path(out_dir),showWarnings=FALSE)
+
+cat("dada2 QC analysis\n==============\n\n")
+cat(paste("Reads: ",read_path,"\n\n"))
+
+fns<-sort(list.files(read_path, full.names=TRUE))
+fnFs<-fns[grepl(".fq",fns)]
+
+fnFs <- as.list(fnFs)
+for(i in 1:length(fnFs)) {                              
+  fnFs[[i]] <- plotQualityProfile(fnFs[[i]],aggregate=aggregate)
+  ggsave(paste(out_dir,'/forward_read_quality',i,'.pdf',sep=''),plot=fnFs[[i]])
+}
+
+if (file.exists('Rplots.pdf')) {
+  file.remove('Rplots.pdf')
+}
+```
+\normalsize
+\newpage
+
+#### Quality control and trimming
+\
+\tiny
+```{r dada-long-read-appendix-00, echo=TRUE, eval = FALSE}
+#!/usr/bin/env Rscript
+
+#$ -j y
+#$ -cwd
+#$ -V
+#$ -pe smp 24
+#$ -mods l_hard mfree 200G
+
+# 1st stage of dada2 workflow: QC and trimming
+
+suppressPackageStartupMessages(library("getopt"))
+num_threads=24
+
+optspec=matrix(c(
+	'reads',    'r', 1, 'character', 'Path to directory of fastq files',
+	'metadata', 'm', 1, 'character', 'Path to metadata file',
+	'trunc',   'F', 2, 'integer',   'Length to truncate reads to (default: no truncation)',
+	'maxee',   'q', 2, 'integer',   'Maximum expected errors for reads (default: 2)',
+	'help',     'h', 0, 'logical',   'Display help'
+),byrow=TRUE,ncol=5)
+
+opt=getopt(optspec)
+
+if (!is.null(opt$help)) {
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$reads)) {
+	cat("Error: no reads argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$metadata)) {
+	cat("Error: no metadata argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$maxee)) {
+	maxee=2
+} else {
+	maxee=opt$maxee
+}
+
+suppressPackageStartupMessages({
+	library("ShortRead")
+	library("ggplot2")
+	library("gridExtra")
+	library("dada2")
+	library("stringr")
+})
+
+writeLines(capture.output(sessionInfo()), "Loop_dada00_trimming.sessionInfo.txt")
+
+set.seed(100)
+
+read_path=opt$reads
+filt_path="filtered"
+metadata_file=opt$metadata
+
+if(!file.exists('cache')) {
+	dir.create('cache')
+}
+
+message("dada2 read trimming\n==============")
+message(paste("Read directory: ",read_path))
+message(paste("Metadata:",metadata_file))
+
+fns<-sort(list.files(read_path, full.names=TRUE))
+
+# Determine median read length of forward and reverse reads based on 1st fastq file
+reads<-readFastq(fns[[1]])
+forward_length<-median(width(reads))
+read_lengths=c(forward_length)
+saveRDS(read_lengths,file='cache/Loop_dada00_read_lengths.txt')
+
+if (length(opt$trunc)) {
+	trunclen<-opt$trunc
+} else {
+	trunclen<-0
+}
+
+message(paste("Truncate forward:",trunclen))
+message(paste("Max expected errors forward:",maxee))
+
+message("\nRead lengths\n============")
+message(paste0("Forward: ",forward_length))
+samples<-read.csv(metadata_file,header = TRUE,sep="\t")
+
+# Qiime mapping files start with '#', but this screws up the column naming, so reset 1st column name correctly...
+colnames(samples)[1]<-'SampleID'
+rownames(samples)<-samples$SampleID
+saveRDS(samples,file='cache/Loopsamdf.rds')
+sample.names<-samples$SampleID
+# Assume that sample name is first element of '_' delimited filename...
+#sample.names<-sapply(strsplit(basename(fns),"_"),'[',1)
+sample.names<-str_replace(basename(fns), ".fq", "")
+saveRDS(sample.names,file='cache/Loopsample_names.rds')
+
+message("\nSample Names\n===========\n")
+print(sample.names)
+
+filtFs <- file.path(filt_path, basename(fns))
+names(filtFs)<-sample.names
+
+if(!file.exists('Loop_trimming_results.rds')){
+	message("\nFiltering reads:\n================")
+	message(paste0("Forward length: ",trunclen))
+	if (trunclen>0) {
+		trim_results <- filterAndTrim(fns, filtFs, truncLen=c(trunclen), minLen=1400, maxLen=1600,
+			maxN=0, maxEE=c(maxee), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=num_threads)
+	} else {
+		trim_results <- filterAndTrim(fns, filtFs, minLen=1400, maxLen=1600,
+			maxN=0, maxEE=c(maxee), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=num_threads)
+	}
+	saveRDS(trim_results,'cache/Loop_trimming_results.rds')
+} else {
+	message('\nRead filtering has already been completed.\n')
+	message('Remove Loop_trimming_results.rds to rerun\n')
+}
