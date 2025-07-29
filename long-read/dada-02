@@ -1,0 +1,358 @@
+#!/usr/bin/env Rscript
+
+#$ -j y
+#$ -cwd
+#$ -V
+#$ -pe smp 24
+#$ -mods l_hard mfree 64G
+
+# Final stage of dada2 pipeline: Merging paired reads, 
+# chimera removal and taxonomic assignment
+
+num_threads=24
+tax_dir='<insert_path_to_folder_with_databases>'
+default_db='silva_138.1_wSpecies'
+
+check_len<-function(x){
+	if(nchar(x)<=50) {
+		cat(paste('Short sequence removed: ',x,"\n"))
+		return(FALSE)
+	} else {
+		return(TRUE)
+	}
+}
+
+getN <- function(x) sum(getUniques(x))
+
+get_dbs<-function(tax_dir) {
+	# Obtains list of available databases, which are symlinks within tax_dir
+
+	files<-list.files(tax_dir)
+	paths<-paste0(tax_dir,files)
+
+	dbs<-(Sys.readlink(paths))
+	dbs<-dbs!=""
+	dbs<-files[dbs]
+
+	return(dbs)	
+}
+
+show_dbs<-function(default_db,dbs) {
+	message("\nAvailable databases\n===================")
+	for (db in dbs) {
+		if (db==default_db) {
+			db=paste0(db," [default]")
+		}
+		message(db)
+	}
+}
+
+summarise_read_counts<-function(read_counts,trimmed_counts) {
+
+	# creates summary output of read counts at different points
+	# of pipeline, and also plot...
+
+	read_counts<-read_counts %>% 
+	  merge(dadaF_counts,on='sample',all.x=TRUE) %>%
+	  merge(seq_counts,on='sample',all.x=TRUE) %>%
+	  merge(trimmed_counts,on='sample',all.x=TRUE)
+	
+	read_counts[is.na(read_counts)] <- 0
+	rownames(read_counts)<-read_counts$sample
+	 read_counts<-read_counts %>% select (c(-sample))
+	
+	colnames(read_counts)<-c('Input', 'Filtered', 'denoisedF','Non-chimeric','Length trimmed')
+	write.table(read_counts,file='read_counts.txt',sep="\t",quote=FALSE,row.names=TRUE,col.names=TRUE)
+
+	read_counts$sample<-row.names(read_counts)
+	sample_count=length(read_counts$sample)
+
+	read_counts<-read_counts %>% 
+		separate(sample,into=c('prefix','sample_id'),sep="\\.",convert = TRUE,remove=FALSE) %>% 
+		arrange(sample_id) %>% 
+		select (-c(sample_id, prefix))
+	read_counts$sample=factor(read_counts$sample,levels=read_counts$sample)
+
+	read_counts <- read_counts %>% 
+		pivot_longer( -sample, names_to='variable', values_to='value',
+					  values_transform = list(value = as.integer)) %>%
+					  mutate(value=value/1000) 
+
+	read_counts$variable=factor(read_counts$variable,
+		levels=c('Input','Filtered','denoisedF','Non-chimeric','Length trimmed'))
+	
+	plot<-ggplot(read_counts,aes(x=variable,y=value,group=sample))+
+	  geom_line()+
+	  facet_wrap(~sample,ncol=ceiling(sqrt(sample_count)))+
+	  theme_bw()+
+	  ylab('Reads x1000')+
+	  theme(axis.title.x=element_blank(),
+	  axis.text.x=element_text(angle=90,hjust=1))
+
+	ggsave(plot,filename='plots/read_counts.pdf',device='pdf',units='cm',height=30,width=30)
+}
+
+plot_errs<-function() {
+
+	# Creates plot of observed/predicted errors using dada2::plotErrors()
+	cat('Plotting errors\n')
+	errF<-readRDS('cache/err_F.rds')
+
+	F_errplot<-plotErrors(errF,nominalQ=TRUE)+ggtitle('Forward Reads')
+
+	error_plots<-grid.arrange(F_errplot,ncol=1)
+	ggsave('plots/error_rate_plots.png',plot=error_plots,width=40,height=20,units='cm')
+
+}
+
+plot_length_dist<-function(orig_lengths, trimmed_lengths) {
+
+	lengthdist_plot1<-ggplot()+
+		geom_freqpoly(fill='firebrick',colour='firebrick',alpha=0.6, data=as.data.frame(orig_lengths),binwidth=1,aes(x=V1)) +
+		theme_bw() +
+		xlab('Amplicon length (bp)')+
+		ggtitle('Pre-trim')
+
+	lengthdist_plot2<-ggplot()+
+		geom_freqpoly(fill='firebrick',colour='firebrick',alpha=0.6, data=as.data.frame(trimmed_lengths),binwidth=1,aes(x=V1)) +
+		theme_bw() +
+		xlab('Amplicon length (bp)')+
+		ggtitle('Post-trim')
+
+	combined_plot<-ggarrange(lengthdist_plot1,lengthdist_plot2,ncol=2,nrow=1)
+	ggsave('plots/amplicon_lengths.pdf',plot=combined_plot,device='pdf',width=20,height=10,units='cm')
+}
+ 
+# Filtering of ASVs to a defined size range to remove spurious
+# merges
+
+# Required args:
+#  ps: phyloseq object
+#  size_range: range to trim as colon separated value i.e. 240:260
+
+filter_to_length<-function(LoopScript01,lower_boundary,upper_boundary) {
+  
+  
+  tax_tab<-tax_table(LoopScript01)
+  otu_tab<-otu_table(LoopScript01)
+  
+  otus<-row.names(tax_tab)
+  otu_lengths<-nchar(otus)
+  otu_df<-data.frame(otus,otu_lengths)
+  
+  trimmed_otu_df<-otu_df %>% filter(between(otu_lengths, lower_boundary,upper_boundary))
+  
+  trimmed_otu_tab<-otu_tab[trimmed_otu_df$otus]
+  trimmed_tax_tab<-tax_tab[trimmed_otu_df$otus]
+  new_LoopScript01<-phyloseq(trimmed_otu_tab,trimmed_tax_tab, sample_data(LoopScript01))
+  
+  return(new_LoopScript01)
+}
+dbs<-get_dbs(tax_dir)
+
+suppressPackageStartupMessages(library("getopt"))
+
+optspec=matrix(c(
+	'name',			'n', 1, 'character',	'Name of job',
+	'taxonomy', 		't', 2, 'character',	paste0('Taxonomy to use (default: ',default_db,')'),
+	'merge_overlap',	'm', 2, 'integer',	'Minimum overlap for merging reads (default: 12)',
+	'size_range',		'r', 2, 'character',	'Length range to trim amplicons (default 240:260)',
+	'list_dbs', 		'd', 0, 'logical',		'Display available databases',
+	'help',     		'h', 0, 'logical',		'Display help'
+),byrow=TRUE,ncol=5)
+
+opt=getopt(optspec)
+if (!is.null(opt$help)) {
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (!is.null(opt$list_dbs)) {
+	show_dbs(default_db,dbs)
+	q(status=1)
+}
+
+if (is.null(opt$name)) {
+	cat("Error: no name argument provided\n")
+	cat(getopt(optspec,usage=TRUE))
+	q(status=1)
+}
+
+if (is.null(opt$taxonomy)) {
+		opt$taxonomy = default_db
+	} else {
+		if (! opt$taxonomy %in% dbs) {
+			message(paste0('\nInvalid database selection: ',opt$taxonomy,"\n"))
+			show_dbs(default_db,dbs)
+			q(status=1)
+		}
+	}
+
+if (is.null(opt$merge_overlap)) {opt$merge_overlap = 12}
+
+# if (is.null(opt$size_range)) {
+# 	opt$size_range='1400:1600'
+# } else {
+# 	if (! ':' %in% opt$size_range) {
+# 		message("Invalid range\n")
+# 		q(status=1)
+# 	}
+# }
+
+suppressPackageStartupMessages({
+	library("tidyverse")
+	library("ShortRead")
+	library("ggplot2")
+	library("gridExtra")
+	library("ggpubr")
+	library("dada2")
+	library("phyloseq")
+	library("dplyr")
+})
+
+writeLines(capture.output(sessionInfo()), "Loop_dada02_taxassign.sessionInfo.txt")
+set.seed(100)
+
+read_path=opt$reads
+filt_path="filtered"
+ref_fasta=paste0(tax_dir,opt$taxonomy)
+
+if(!file.exists('cache/Loopsamdf.rds')) {
+	cat('Loopsamdf.rds does not exist. Please run dada2_00.R to generate this file')
+	stop()
+} else {
+	samdf<-readRDS('cache/Loopsamdf.rds')
+}
+
+if(!file.exists('cache/Loop_dada00_read_lengths.txt')){
+	cat('Loop_dada00_read_lengths.txt does not exist. Please run dada2_00.R to generate this file')
+	stop()
+} else {
+	read_lengths<-readRDS('cache/Loop_dada00_read_lengths.txt')
+}
+
+if(!file.exists('cache/Loopsample_names.rds')){
+	cat('Loopsample_names.rds does not exist. Please run dada2_00.R to generate this file')
+	stop()
+} else {
+	sample.names<-readRDS('cache/Loopsample_names.rds')
+}
+
+if(!file.exists('cache/Loop_trimming_results.rds')){
+	cat('Loop_trimming_results.rds does not exist. Please run dada2_00.R to generate this file')
+	stop()
+} else {
+	read_counts<-readRDS('cache/Loop_trimming_results.rds')
+	sample<-str_replace(rownames(read_counts), "_R1_val_1.fq.gz", "")
+	#sample<-sapply(strsplit(rownames(read_counts),"_"),'[',1)
+	read_counts<-data.frame(cbind(read_counts,sample))
+}
+
+## minboot defined bootstrap threshold - recommended for 50 if reads <250 bp, otherwise 80
+if(read_lengths[1]<250) {
+	min_boot=50
+} else {
+	min_boot=80
+}
+
+cat("\ndada2 analysis\n==============\n")
+cat(paste("Taxonomy:",opt$taxonomy,"\n"))
+cat(paste("Merge overlap:",opt$merge_overlap,"\n"))
+cat(paste("Amplicon size range: 1400:1600","\n"))
+cat(paste("Minimum bootstrap confidence:", min_boot,"\n\n"))
+
+if(!file.exists('plots')) {
+	dir.create('plots')
+}
+
+if(!file.exists('cache/derep_F.rds')) {
+	cat('derep_F.rds does not exist. Please run dada2_01.R to generate this file')
+	stop()
+} else {
+	cat('Reloading cached forward deplicated reads\n')
+	derepFs<-readRDS('cache/derep_F.rds')
+}
+
+
+if(!file.exists('cache/dada_F.rds')) {
+	cat('dada_F.rds does not exist. Please run dada2_01.R to generate this file')
+	stop()
+} else {
+	cat('Reloading cached dada2 forward object\n')
+	dadaF<-readRDS('cache/dada_F.rds')
+	dadaF_counts<-data.frame(sapply(dadaF,getN))
+	dadaF_counts$sample<-rownames(dadaF_counts)
+}
+
+
+if(!file.exists('cache/seqtab.rds')) {
+	message('\nMake Sequence Table\n=============')
+	seqtab.all<-makeSequenceTable(dadaF)
+
+	message("\nRemoving chimeras\n=================")
+	seqtab<-removeBimeraDenovo(seqtab.all,multithread=num_threads)
+	removed<-round(100-(sum(seqtab)/sum(seqtab.all)*100),digits=2)
+	cat(paste('Proportion of reads removed: ',as.character(removed),"%\n",sep=""))
+
+	message("\nChecking for short sequences\n============================")
+	short_seqs<-sapply(colnames(seqtab),check_len)
+	seqtab<-seqtab[,short_seqs]
+	
+	seq_counts<-data.frame(rowSums(seqtab))
+	seq_counts$sample<-rownames(seq_counts)
+	
+	saveRDS(seqtab,'cache/seqtab.rds')
+	
+} else {
+	message('Reloading cached seqtab')
+	seqtab<-readRDS('cache/seqtab.rds')
+	seq_counts<-data.frame(rowSums(seqtab))
+	seq_counts$sample<-rownames(seq_counts)
+}
+
+plot_errs()
+
+if(!file.exists('cache/taxtab.rds')) {
+	message('\nAssigning taxonomy\n===================')
+	taxtab<-assignTaxonomy(seqtab, refFasta = ref_fasta, minBoot=min_boot, multithread=num_threads,verbose=TRUE)
+	if (length(colnames(taxtab))==6) {
+		colnames(taxtab)<-c("Kingdom","Phylum","Class","Order","Family","Genus")
+	} else if (length(colnames(taxtab))==7) {
+		colnames(taxtab)<-c("Kingdom","Phylum","Class","Order","Family","Genus", "Species")
+	} else {
+		message("Error: Unrecognised taxtab columns: ", colnames(taxtab))
+		quit()
+	}
+	saveRDS(taxtab,file='cache/taxtab.rds')
+} else {
+	message('Reloading cached taxtab')
+	taxtab<-readRDS('cache/taxtab.rds')
+}
+
+if(!file.exists(paste(opt$name,'_dada2_',opt$taxonomy,'.rds',sep=''))) {
+	message('\nCreating phyloseq object\n========================')
+  rownames(samdf) <- gsub(".fq", "", rownames(samdf))
+  rownames(seqtab) <- gsub(".fq", "", rownames(seqtab))
+	Loop_ps<-phyloseq(
+		tax_table(taxtab),
+		sample_data(samdf),
+		otu_table(t(seqtab),taxa_are_rows=TRUE)
+	)
+	saveRDS(Loop_ps,file=paste(opt$name,'_dada2_',opt$taxonomy,'.rds',sep=''))
+
+	orig_lengths<-as.data.frame(lapply(rownames(Loop_ps@tax_table),nchar))
+	orig_lengths<-t(orig_lengths)
+
+	Loop_ps<-filter_to_length(Loop_ps,1400,1600)
+	saveRDS(Loop_ps,file=paste(opt$name,'_dada2_trimmed_',opt$taxonomy,'.rds',sep=''))
+
+	trimmed_lengths<-as.data.frame(lapply(rownames(Loop_ps@tax_table),nchar))
+	trimmed_lengths<-t(trimmed_lengths)
+	
+	plot_length_dist(orig_lengths,trimmed_lengths)
+
+	trimmed_counts<-data.frame(rowSums(t(Loop_ps@otu_table)))
+	trimmed_counts$sample<-rownames(trimmed_counts)
+}
+
+summarise_read_counts(read_counts,trimmed_counts)
